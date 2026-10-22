@@ -1,0 +1,29 @@
+{
+  "status": "initial_pool_preserved_not_used_for_injection",
+  "initial_manifest_sha256": "a4f70046360831a625cd20ce7226ee5b06b14a8871988cf88f4ddff6536e7571",
+  "selected_manifest_sha256": "5fec4e7708c970992353b2312f5075bc29e883d66a2bb47f016cc3994201f3de",
+  "reason": "Initial failure-only pool had1749 valid observations,1719 failures,30 strict successes. Require at least one observed strict success per injected task before GPU work.",
+  "selected_pool": {
+    "tasks": 192,
+    "trajectory_counts": {
+      "seen": 1988,
+      "valid": 1813,
+      "success": 591,
+      "failure": 1222,
+      "invalid_diagnostic_only": 175,
+      "candidate_comparison": 284,
+      "option_constraints": 323,
+      "ineffective_exploration": 504,
+      "budget_or_category": 92,
+      "guard_recovery": 344
+    },
+    "tasks_per_tag": {
+      "candidate_comparison": 101,
+      "option_constraints": 85,
+      "ineffective_exploration": 158,
+      "budget_or_category": 47,
+      "guard_recovery": 154
+    }
+  },
+  "selected_before_gpu": true
+}

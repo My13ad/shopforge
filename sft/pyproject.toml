@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shopping-sft-workspace"
+version = "0.1.0"
+description = "Independent Shopping Agent SFT collection and training workspace"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["tqdm>=4.66,<5"]
+
+[project.optional-dependencies]
+sft = [
+  "torch>=2.5",
+  "transformers @ git+https://github.com/huggingface/transformers.git@7ea2320c76117e6742364808a666ef6f2fb40a67",
+  "peft>=0.15,<1",
+  "accelerate>=1,<2",
+  "torchvision",
+  "pillow",
+  "swanlab>=0.8,<1",
+]
+sft-accelerated = [
+  "bitsandbytes>=0.45,<1",
+  "liger-kernel>=0.6,<1",
+]
+eval-accelerated = [
+  "flash-linear-attention==0.5.2",
+]
+dev = [
+  "build>=1.2,<2",
+  "pytest>=8,<10",
+  "ruff>=0.9,<1",
+  "mypy>=1.14,<2",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"shopping_grpo.resources" = ["*.json"]
+
+[tool.uv]
+override-dependencies = ["numpy==2.2.6"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.mypy]
+python_version = "3.10"
+packages = ["shopping_grpo"]
+ignore_missing_imports = true

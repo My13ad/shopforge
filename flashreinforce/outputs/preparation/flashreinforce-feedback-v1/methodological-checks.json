@@ -1,0 +1,14 @@
+{
+  "coverage": "11/11 checked",
+  "simpson_paradox": "Report full train953 and hard192, disjoint sampler lanes, separate completion/admission stages. Tags overlap.",
+  "ecological_fallacy": "Historical failure rates guide task sampling only; not attributed to all user requests or a single checkpoint.",
+  "berkson_selection": "Hardness selected on historical training receipts; parent912 selected retrospectively on reused Final200. Confirmation set frozen before new model results.",
+  "collider_bias": "Conditioning on failure and at least one success is explicit. Persistent failures remain background, not removed from train.",
+  "base_rate_neglect": "953 full tasks, 228 eligible, 192 injected, 162 persistent failures and615 invalid trajectories all accounted for.",
+  "regression_to_mean": "No guarantee high historical failure repeats at912, or that peak912 is repeatable; unchanged-scheduler control planned.",
+  "survivorship_bias": "Invalid rewards do not contribute failure evidence, but all counts retained. Full native batches still skip without assigning rewards.",
+  "look_elsewhere": "One frozen pool/mixture pair and fixed maximum budget. No confirmation-driven checkpoint search.",
+  "forking_paths": "Initial failure-only pool preserved as screening; success requirement finalized before GPU. Both exact manifests available, only learnable used.",
+  "causation": "Mining tags are observational proxies, not causal error diagnoses; A/B changes sampler fraction only.",
+  "reverse_causality": "Historical difficulty is used prospectively; no improvement or training-cause claim before experiments."
+}

@@ -1,0 +1,12 @@
+# Versions recorded by completed E1 and OPD-32 runs; use a separate environment.
+# The archived OPD calibration checks torch.__version__ == 2.8.0+cu128 exactly.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0+cu128
+transformers @ git+https://github.com/huggingface/transformers.git@7ea2320c76117e6742364808a666ef6f2fb40a67
+peft==0.21.2
+accelerate==1.15.0
+liger-kernel==0.8.2
+flash-linear-attention==0.5.2
+einops==0.8.2
+pillow
+tqdm

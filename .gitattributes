@@ -1,0 +1,2 @@
+# Preserve source and data bytes used by SHA-256 checks on every platform.
+* -text

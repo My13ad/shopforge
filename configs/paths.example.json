@@ -1,0 +1,19 @@
+{
+  "models": {
+    "base": "models/Qwen3.5-2B-Base",
+    "teacher": "models/Qwen3.8-27B-FP8"
+  },
+  "python": {
+    "sft": ".venvs/sft/bin/python",
+    "teacher": ".venvs/teacher/bin/python",
+    "flash": "flashreinforce/.venv/bin/python"
+  },
+  "runs": "runs",
+  "sft_adapter": "runs/sft-e1/adapter",
+  "sft_reference": "runs/sft-reference",
+  "opd_adapter": "runs/opd32/round-32/training/adapter",
+  "shop_urls": {
+    "sft": "http://127.0.0.1:5700",
+    "flash": "http://127.0.0.1:5721"
+  }
+}

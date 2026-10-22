@@ -1,0 +1,10 @@
+{
+  "actual_uploaded_source_sha256": {
+    "opd-pilot/common.py": "4ff01d0f118a353ad47bee6e34c5391c76fec02572cf743a96d30f702559dba2",
+    "opd-pilot/phases.py": "5f437c12bc2a8fb2342c84038eb439fd59a37cac76eec39a82ad4634e6509099",
+    "opd-pilot/test_objectives.py": "88fd9be2a063b7442d7ec1aad4087ba9e3360dfa7cc2d506fc5cf3990aebf8d3",
+    "opd-pilot/worker.py": "405434246f03dadb7e28836f9991e25540325fd5721c4302f7eadb3dd8ea3de0",
+    "outputs/opd-scale/v1/cleanup_remote.py": "d0f2c6e15255b44c87c8d366b65b1fca53e21dc3791367765ea408d256dcf6bd"
+  },
+  "note": "Initial tar upload was followed by a verified cleanup helper correction for packaged Final IDs; source hashes were checked before launch."
+}

@@ -1,0 +1,46 @@
+{
+  "train953": {
+    "tasks": 953,
+    "trajectory_counts": {
+      "seen": 9824,
+      "valid": 9209,
+      "success": 5942,
+      "failure": 3267,
+      "invalid_diagnostic_only": 615,
+      "candidate_comparison": 712,
+      "option_constraints": 790,
+      "ineffective_exploration": 1266,
+      "budget_or_category": 457,
+      "guard_recovery": 844
+    },
+    "tasks_per_tag": {
+      "candidate_comparison": 258,
+      "option_constraints": 241,
+      "ineffective_exploration": 491,
+      "budget_or_category": 147,
+      "guard_recovery": 416
+    }
+  },
+  "hard192": {
+    "tasks": 192,
+    "trajectory_counts": {
+      "seen": 1988,
+      "valid": 1813,
+      "success": 591,
+      "failure": 1222,
+      "invalid_diagnostic_only": 175,
+      "candidate_comparison": 284,
+      "option_constraints": 323,
+      "ineffective_exploration": 504,
+      "budget_or_category": 92,
+      "guard_recovery": 344
+    },
+    "tasks_per_tag": {
+      "candidate_comparison": 101,
+      "option_constraints": 85,
+      "ineffective_exploration": 158,
+      "budget_or_category": 47,
+      "guard_recovery": 154
+    }
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "status": "CPU_PREPARED_GPU_NOT_STARTED",
+  "parent_adapter_sha256": "466b8f402a21d0cd7ad63d97ceaf682dd7a8699a6c084c3dcc2754fdb8ad4fe1",
+  "parent_weight_lineage_updates": 912,
+  "parent_selection": "retrospective on reused Final200; exploratory",
+  "arms": {
+    "control": {
+      "hard_lane_fraction": 0.0
+    },
+    "hard20": {
+      "hard_lane_fraction": 0.2
+    }
+  },
+  "shared": {
+    "maximum_optimizer_updates": 256,
+    "validation_interval": 64,
+    "minimum_updates": 128,
+    "patience": 3,
+    "learning_rate": 5e-07,
+    "warmup_steps": 1,
+    "seed": 42,
+    "fresh_optimizer": true,
+    "native_rewards": true,
+    "batch_size": 8,
+    "async_inflight": 32,
+    "async_queue_batches": 8,
+    "maximum_candidate_batches": 1024,
+    "maximum_consecutive_skips": 16,
+    "validation": "fixed50 serial eager native greedy",
+    "ties": "earlier checkpoint"
+  },
+  "gpu_acceptance": [
+    "standalone parent912 validation50 with live tensor/readback audit",
+    "pilot1: one control optimizer update, validation at0 and1, retain native checkpoint",
+    "export pilot step1 adapter-only on CPU",
+    "standalone pilot-step1 validation50",
+    "compare all50 task outcomes/actions/rewards/tokens at both0 and1; require exact agreement before A/B"
+  ],
+  "comparison": "hard20 versus control; both fresh optimizer from identical912; report matched-update comparisons and compute-to-selected checkpoints when early stopping differs",
+  "confirmation": {
+    "tasks": 200,
+    "select_before_running": "freeze each arm selected checkpoint using validation50 only, then paired comparison against retained parent912; do not tune from confirmation results"
+  },
+  "disk_policy": "Provision >=24GiB as a conservative planning floor for pilot plus two native states and checkpoint rotation; measure actual sizes. Alternatively verify CPU offload before separately authorized cleanup.",
+  "execution_authorized_now": false,
+  "remote_connected": false,
+  "teacher_calls": 0,
+  "original_final200_training_usage": false,
+  "sampling_manifest": "pool-learnable/sampling-manifest.json",
+  "sampling_manifest_sha256": "5fec4e7708c970992353b2312f5075bc29e883d66a2bb47f016cc3994201f3de",
+  "eligible_learnable_tasks": 228,
+  "persistent_failure_tasks": 162,
+  "gpu_acceptance_passed": false
+}

@@ -1,0 +1,515 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Adapted from OpenRLHF (https://github.com/OpenRLHF/OpenRLHF),
+# Copyright (c) OpenRLHF contributors, licensed under the Apache License, Version 2.0.
+
+from typing import Callable, Dict, Optional, Tuple
+
+import torch
+import torch.nn as nn
+
+from .score_centering import score_centering_correction
+from .utils import masked_mean
+
+
+def masked_sum(values: torch.Tensor, mask: torch.Tensor, dim: int | tuple[int, ...] | None = None) -> torch.Tensor:
+    """Masked sum.
+
+    NaNs outside the mask are zeroed before summation so padding-only garbage
+    cannot contaminate the result.
+    """
+    valid_values = torch.where(mask.bool(), values, 0.0)
+    return valid_values.sum(dim=dim)
+
+
+def agg_loss(
+    loss_mat: torch.Tensor,
+    loss_mask: torch.Tensor,
+    loss_agg_mode: str,
+    dp_size: int = 1,
+    batch_num_tokens: Optional[torch.Tensor | int] = None,
+    global_batch_size: Optional[torch.Tensor | int] = None,
+    loss_scale_factor: Optional[int] = None,
+    prompt_token_counts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Aggregate token/sequence losses following the ``agg_loss`` contract.
+
+    The returned scalar is invariant to DP/FSDP averaging when callers provide
+    global batch metadata. For ``token-mean`` this is exactly:
+    ``masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size``.
+
+    ``prompt-mean-token-mean`` (token-mean inside each prompt, plain mean over prompts)
+    needs ``prompt_token_counts`` — per sequence, the action tokens of its prompt in the
+    whole optimizer-step batch — and ``global_batch_size`` = that batch's prompt count.
+    """
+    if loss_agg_mode == "token-mean":
+        if batch_num_tokens is None:
+            if dp_size > 1:
+                raise ValueError("(global) batch_num_tokens is required when dp_size > 1")
+            batch_num_tokens = loss_mask.sum()
+        loss_sum = masked_sum(loss_mat, loss_mask)
+        denom = torch.as_tensor(batch_num_tokens, device=loss_sum.device, dtype=loss_sum.dtype)
+        if denom.item() == 0:
+            return loss_sum * 0.0
+        return loss_sum / denom * dp_size
+
+    if loss_agg_mode in {"seq-mean-token-sum", "seq-mean-token-sum-norm"}:
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
+        seq_mask = (torch.sum(loss_mask, dim=-1) > 0).float()
+        if global_batch_size is None:
+            if dp_size > 1:
+                raise ValueError("global_batch_size is required when dp_size > 1")
+            global_batch_size = seq_mask.sum()
+        loss_sum = masked_sum(seq_losses, seq_mask)
+        denom = torch.as_tensor(global_batch_size, device=loss_sum.device, dtype=loss_sum.dtype)
+        if denom.item() == 0:
+            return loss_sum * 0.0
+        loss = loss_sum / denom * dp_size
+        if loss_agg_mode == "seq-mean-token-sum-norm":
+            loss /= loss_scale_factor if loss_scale_factor is not None else loss_mask.shape[-1]
+        return loss
+
+    if loss_agg_mode == "seq-mean-token-mean":
+        seq_token_counts = torch.sum(loss_mask, dim=-1)
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / (seq_token_counts + 1e-8)
+        seq_mask = (seq_token_counts > 0).float()
+        if global_batch_size is None:
+            if dp_size > 1:
+                raise ValueError("global_batch_size is required when dp_size > 1")
+            global_batch_size = seq_mask.sum()
+        loss_sum = masked_sum(seq_losses, seq_mask)
+        denom = torch.as_tensor(global_batch_size, device=loss_sum.device, dtype=loss_sum.dtype)
+        if denom.item() == 0:
+            return loss_sum * 0.0
+        return loss_sum / denom * dp_size
+
+    if loss_agg_mode == "prompt-mean-token-mean":
+        if prompt_token_counts is None or global_batch_size is None:
+            raise ValueError("prompt-mean-token-mean needs prompt_token_counts and global_batch_size (prompt count)")
+        seq_losses = masked_sum(loss_mat, loss_mask, dim=-1) / prompt_token_counts.clamp(min=1)
+        return seq_losses.sum() / global_batch_size * dp_size
+
+    raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
+
+
+class SFTLoss(nn.Module):
+    """
+    SFT Loss
+    """
+
+    def __init__(self, token_level_loss: bool = True, loss_agg_mode: str = "token-mean"):
+        super().__init__()
+        self.token_level_loss = token_level_loss
+        self.loss_agg_mode = loss_agg_mode
+
+    def forward(
+        self,
+        per_token_logps: torch.Tensor,
+        loss_mask: torch.Tensor,
+        dp_size: int = 1,
+        batch_num_tokens: Optional[torch.Tensor] = None,
+        global_batch_size: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.token_level_loss:
+            return agg_loss(
+                -per_token_logps,
+                loss_mask,
+                self.loss_agg_mode,
+                dp_size=dp_size,
+                batch_num_tokens=batch_num_tokens,
+                global_batch_size=global_batch_size,
+            )
+        return masked_mean(-per_token_logps, loss_mask, dim=-1).mean()
+
+
+class ValueLoss(nn.Module):
+    """Clipped value-function loss for PPO.
+
+    Regresses the critic's current ``values`` onto the GAE targets ``returns``, with
+    the prediction symmetrically clipped around the collection-time ``old_values`` and
+    the larger of the clipped/unclipped squared error taken, scaled by ``0.5`` (the
+    standard PPO / verl value-clip objective). Inputs live on the dense next-token step
+    axis; ``action_mask`` selects the value-bearing positions, and aggregation reuses
+    the same DP/FSDP-invariant ``agg_loss`` contract as ``PolicyLoss``.
+    """
+
+    def __init__(self, value_clip: Optional[float] = 0.2, loss_agg_mode: str = "token-mean") -> None:
+        super().__init__()
+        self.value_clip = value_clip
+        self.loss_agg_mode = loss_agg_mode
+
+    def forward(
+        self,
+        values: torch.Tensor,
+        old_values: torch.Tensor,
+        returns: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
+        dp_size: int = 1,
+        batch_num_tokens: Optional[torch.Tensor] = None,
+        global_batch_size: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        values = values.float()
+        returns = returns.float()
+        surr_unclipped = (values - returns).pow(2)
+        if self.value_clip is not None:
+            old_values = old_values.float()
+            values_clipped = old_values + (values - old_values).clamp(-self.value_clip, self.value_clip)
+            surr_clipped = (values_clipped - returns).pow(2)
+            loss_mat = 0.5 * torch.max(surr_unclipped, surr_clipped)
+            # Fraction of positions where the prediction was clipped (for logging).
+            clip_frac = masked_mean((torch.abs(values - old_values) > self.value_clip).float(), action_mask, dim=None)
+        else:
+            loss_mat = 0.5 * surr_unclipped
+            clip_frac = None
+
+        reported_loss = masked_mean(loss_mat.detach(), action_mask, dim=None)
+        loss = agg_loss(
+            loss_mat,
+            action_mask,
+            self.loss_agg_mode,
+            dp_size=dp_size,
+            batch_num_tokens=batch_num_tokens,
+            global_batch_size=global_batch_size,
+        )
+        return loss, reported_loss, clip_frac
+
+
+# ──────────────── policy-loss surrogates (registry, mirrors advantage.py) ────────────────
+# A surrogate maps the per-token IS ``ratio`` + advantages to a per-token loss and the
+# clip-fraction metric; PolicyLoss.forward owns everything shared (ratio, IS correction,
+# aggregation). Register a new surrogate the same way advantage estimators register, so it
+# plugs in without editing forward:  @register_policy_loss("gspo") def ...(...).
+PolicyLossFn = Callable[..., Tuple[torch.Tensor, torch.Tensor]]
+POLICY_LOSSES: Dict[str, PolicyLossFn] = {}
+
+
+def register_policy_loss(name: str) -> Callable[[PolicyLossFn], PolicyLossFn]:
+    """Register a policy-loss surrogate under `name`."""
+
+    def decorator(fn: PolicyLossFn) -> PolicyLossFn:
+        if name in POLICY_LOSSES and POLICY_LOSSES[name] is not fn:
+            raise ValueError(f"Policy loss '{name}' is already registered")
+        POLICY_LOSSES[name] = fn
+        return fn
+
+    return decorator
+
+
+def get_policy_loss(name: str) -> PolicyLossFn:
+    if name not in POLICY_LOSSES:
+        raise ValueError(f"Unknown policy loss '{name}'. Registered: {sorted(POLICY_LOSSES)}")
+    return POLICY_LOSSES[name]
+
+
+@register_policy_loss("ppo")
+def ppo_policy_loss(ratio, advantages, log_probs, action_mask, *, clip_eps_low, clip_eps_high, dual_clip, **_):
+    """Clipped PPO surrogate `-min(r·A, clip(r)·A)`, optionally dual-clipped for A<0."""
+    surr1 = ratio * advantages
+    surr2 = ratio.clamp(1 - clip_eps_low, 1 + clip_eps_high) * advantages
+    if dual_clip is None:
+        loss = -torch.min(surr1, surr2)
+    else:
+        clip1 = torch.min(surr1, surr2)
+        # Dual-clip: extra lower bound for negative advantages (clip2 for A<0, clip1 for A>=0).
+        clip2 = torch.max(clip1, dual_clip * advantages)
+        loss = -torch.where(advantages < 0, clip2, clip1)
+    clip_ratio = masked_mean(torch.lt(surr2, surr1).float(), action_mask, dim=None)
+    return loss, clip_ratio
+
+
+@register_policy_loss("gspo")
+def gspo_policy_loss(ratio, advantages, log_probs, action_mask, *, clip_eps_low, clip_eps_high, policy_log_ratio, **_):
+    """GSPO (https://arxiv.org/abs/2507.18071): clip one IS ratio per SEQUENCE, not per token.
+
+    The ratio is the sequence's geometric mean `s = exp(mean_t log(pi/pi_old))`, so a single
+    outlier token can no longer clip (or blow up) the whole update -- the failure mode PPO's
+    per-token ratio has on long MoE rollouts. Gradient still flows per token via the identity
+    `log s_t = sg[log s] + log_prob - sg[log_prob]`, which is numerically `log s` but carries
+    each token's own gradient (GSPO-token in the paper). Recommended with
+    `--actor.loss_agg_mode seq-mean-token-mean`, the aggregation the objective is defined over.
+    """
+    # `policy_log_ratio` is forward's already-clamped log-ratio, so `s` inherits the same
+    # +-log_ratio_limit bound (a mean of bounded terms) and needs no clamp of its own.
+    seq_log_ratio = masked_mean(policy_log_ratio, action_mask, dim=-1).detach().unsqueeze(-1)
+    seq_ratio = (log_probs - log_probs.detach() + seq_log_ratio).exp()
+    surr1 = seq_ratio * advantages
+    surr2 = seq_ratio.clamp(1 - clip_eps_low, 1 + clip_eps_high) * advantages
+    loss = -torch.min(surr1, surr2)
+    clip_ratio = masked_mean(torch.lt(surr2, surr1).float(), action_mask, dim=None)
+    return loss, clip_ratio
+
+
+@register_policy_loss("cispo")
+def cispo_policy_loss(ratio, advantages, log_probs, action_mask, *, clip_eps_high, **_):
+    """CISPO (https://arxiv.org/abs/2506.13585): stop-gradient upper-clipped IS weight,
+    REINFORCE through log-probs so clipped tokens still contribute gradient."""
+    clipped_ratio = ratio.clamp_max(clip_eps_high).detach()
+    loss = -clipped_ratio * advantages * log_probs
+    clip_ratio = masked_mean((ratio > clip_eps_high).float(), action_mask, dim=None)
+    return loss, clip_ratio
+
+
+class PolicyLoss(nn.Module):
+    """
+    Clipped policy-gradient loss for non-critic RL.
+
+    Inputs live on the dense next-token step axis. For multi-turn trajectories,
+    action_mask selects generated action tokens and excludes observation/tool
+    feedback slots without changing tensor alignment.
+    """
+
+    def __init__(
+        self,
+        clip_eps_low: float = 0.2,
+        clip_eps_high: float = 0.2,
+        dual_clip: float = None,
+        token_level_loss: bool = True,
+        is_correction_threshold: list = None,
+        is_correction_level: str = "off",
+        is_correction_mode: str = "mask",
+        loss_agg_mode: str = "token-mean",
+        loss_mode: str = "ppo",
+        is_correction_gating: str = "ratio",
+        score_centering: bool = False,
+    ) -> None:
+        super().__init__()
+        self.clip_eps_low = clip_eps_low
+        self.clip_eps_high = clip_eps_high
+        self.token_level_loss = token_level_loss
+        self.dual_clip = dual_clip
+        # Train/rollout (FSDP-actor vs vLLM) logprob-mismatch correction, applied to
+        # the per-token off-policy IS ratio pi_train/pi_rollout. Two knobs:
+        #   is_correction_level: granularity of the ratio that gets gated —
+        #     off   -> correction disabled
+        #     token -> each token's own ratio (robust to a single outlier token)
+        #     seq   -> product of a sequence's token ratios = exp(sum) (unbiased, high var)
+        #     geo   -> geometric mean = exp(mean) (per-seq, balanced bias/variance)
+        #   is_correction_mode: what to do with a unit outside [low, high] bounds —
+        #     mask  -> drop it (zero gradient); keep the per-token IS weight otherwise
+        #     clip  -> keep it, clamp its weight into [low, high]
+        #     trunc -> keep it, clamp only the upper tail (small weights unchanged)
+        self.is_correction_threshold = is_correction_threshold
+        self.is_correction_level = is_correction_level
+        self.is_correction_mode = is_correction_mode
+        self.loss_agg_mode = loss_agg_mode
+        self.loss_mode = loss_mode
+        self.policy_loss_fn = get_policy_loss(loss_mode)  # raises on an unregistered name
+        # Dual-clip policy objective: https://arxiv.org/pdf/1912.09729
+        if dual_clip is not None:
+            assert dual_clip > 1.0, f"dual_clip must be > 1.0, got {dual_clip}"
+        if self.loss_mode == "cispo":
+            # CISPO clamps the raw ratio to an absolute ceiling (not a +offset like PPO's
+            # surr2), so clip_eps_high here must be passed as that ceiling (e.g. 1.2).
+            assert clip_eps_high >= 1.0, f"clip_eps_high must be >= 1.0 if loss_mode='cispo', got {clip_eps_high}"
+        # dual_clip is an extra bound on PPO's min(surr1, surr2); the other surrogates do not
+        # compute that min, so reject it rather than silently ignore it.
+        if dual_clip is not None and self.loss_mode != "ppo":
+            raise ValueError(
+                f"dual_clip is a PPO-only extra bound; it has no effect under loss_mode={self.loss_mode!r}"
+            )
+
+        self.is_correction_gating = is_correction_gating
+        # Score centering (https://arxiv.org/abs/2609.20807) adds the sampler-centering term to the
+        # surrogate; with one update per batch the ratio is 1, so the surrogate's gradient is the
+        # REINFORCE score the paper centers. It composes with a per-token importance weight only
+        # (Eq. 14): sequence gates (seq/geo) and divergence gates (binary_kl/tv) have no head form.
+        self.score_centering = score_centering
+        if score_centering and (
+            self.is_correction_level not in {"off", "token"} or self.is_correction_gating != "ratio"
+        ):
+            raise ValueError(
+                "score_centering composes with the per-token ratio weight only (is_correction_level off|token, "
+                "is_correction_gating ratio: the paper's TIS/MIS variants). A sequence gate such as the FlashREINFORCE "
+                "recipe's seq/geo binary_kl mask has no per-candidate form, and its surviving tokens carry the raw ratio, "
+                "under which the centering term is zero: use score centering instead of that gate, not on top of it."
+            )
+
+        if self.is_correction_level not in {"off", "token", "seq", "geo"}:
+            raise ValueError(f"is_correction_level must be off/token/seq/geo, got {self.is_correction_level}")
+        if self.is_correction_mode not in {"mask", "clip", "trunc"}:
+            raise ValueError(f"is_correction_mode must be mask/clip/trunc, got {self.is_correction_mode}")
+        if self.is_correction_gating not in {"ratio", "binary_kl", "tv"}:
+            raise ValueError(f"is_correction_gating must be ratio/binary_kl/tv, got {self.is_correction_gating}")
+        # Only the per-token ratio is a weight that can be clamped (clip/trunc); per-sequence gates
+        # (seq/geo) and divergence gates (binary_kl/tv) are rejection filters, so only mask applies.
+        if self.is_correction_mode != "mask" and self.is_correction_level not in {"off", "token"}:
+            raise ValueError(f"is_correction_level={self.is_correction_level} only supports is_correction_mode=mask")
+        if self.is_correction_gating != "ratio":
+            if self.is_correction_mode != "mask" or self.is_correction_level == "geo":
+                raise ValueError(
+                    f"is_correction_gating={self.is_correction_gating} only supports mode mask, level token/seq"
+                )
+            # A divergence is bounded from above only; the default ratio band [0.5, 5] would reject everything.
+            if (self.is_correction_threshold or [0])[0] > 0:
+                raise ValueError(
+                    f"is_correction_gating={self.is_correction_gating} takes an upper bound only (a single delta)"
+                )
+
+    def forward(
+        self,
+        log_probs: torch.Tensor,
+        old_log_probs: torch.Tensor,
+        advantages: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
+        rollout_log_probs: Optional[torch.Tensor] = None,
+        dp_size: int = 1,
+        batch_num_tokens: Optional[torch.Tensor] = None,
+        global_batch_size: Optional[torch.Tensor] = None,
+        prompt_token_counts: Optional[torch.Tensor] = None,
+        top_log_probs: Optional[torch.Tensor] = None,
+        rollout_top_log_probs: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """``top_log_probs`` / ``rollout_top_log_probs`` are ``[B, T-1, k]``: the trained policy's and
+        the sampler's log-probs of the sampler's top-k ids per step (score centering only)."""
+        log_ratio_limit = 30.0
+        policy_log_ratio = torch.nan_to_num(
+            log_probs.float() - old_log_probs.float(),
+            nan=0.0,
+            posinf=log_ratio_limit,
+            neginf=-log_ratio_limit,
+        )
+        advantages = torch.nan_to_num(advantages.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        if action_mask is not None:
+            mask = action_mask.bool()
+            policy_log_ratio = torch.where(mask, policy_log_ratio, torch.zeros_like(policy_log_ratio))
+            advantages = torch.where(mask, advantages, torch.zeros_like(advantages))
+
+        ratio = policy_log_ratio.clamp(min=-log_ratio_limit, max=log_ratio_limit).exp()
+        loss, clip_ratio = self.policy_loss_fn(
+            ratio,
+            advantages,
+            log_probs,
+            action_mask,
+            clip_eps_low=self.clip_eps_low,
+            clip_eps_high=self.clip_eps_high,
+            dual_clip=self.dual_clip,
+            policy_log_ratio=policy_log_ratio,
+        )
+
+        vllm_kl = None
+        is_filter_ratio = None
+        if self.is_correction_level != "off":
+            if rollout_log_probs is None:
+                raise ValueError("rollout_log_probs is required when IS correction is enabled")
+            low, high = self.is_correction_threshold
+            # per-token off-policy log-ratio  log(pi_train / pi_rollout)
+            is_log_ratio = torch.nan_to_num(
+                old_log_probs.float() - rollout_log_probs.float(),
+                nan=0.0,
+                posinf=log_ratio_limit,
+                neginf=-log_ratio_limit,
+            ).clamp(min=-log_ratio_limit, max=log_ratio_limit)
+            token_ratio = torch.exp(is_log_ratio).detach()
+
+            # (1) per-token gating statistic: the importance ratio itself (TIS) or the sampled-token
+            # divergence between rollout and train policy (binary_kl / tv: a trust region).
+            if self.is_correction_gating == "ratio":
+                gating_stat = token_ratio
+            elif self.is_correction_gating == "binary_kl":
+                p = rollout_log_probs.float().exp().clamp(1e-6, 1 - 1e-6)
+                q = old_log_probs.float().exp().clamp(1e-6, 1 - 1e-6)
+                gating_stat = p * (p.log() - q.log()) + (1 - p) * ((1 - p).log() - (1 - q).log())
+            elif self.is_correction_gating == "tv":
+                gating_stat = (rollout_log_probs.float().exp() - old_log_probs.float().exp()).abs()
+            else:
+                raise ValueError(f"unknown is_correction_gating {self.is_correction_gating}")
+            # aggregated per sequence (kept at [B, 1] so the filter metric stays per-sequence) for
+            # seq/geo: ratio product = exp(sum), geometric mean = exp(mean), divergence = its mean.
+            if self.is_correction_level == "seq" and self.is_correction_gating == "ratio":
+                seq_log = (is_log_ratio * action_mask.float()).sum(dim=-1, keepdim=True)
+                gating_stat = torch.exp(seq_log.clamp(min=-log_ratio_limit, max=log_ratio_limit))
+            elif self.is_correction_level == "seq":
+                gating_stat = masked_mean(gating_stat, action_mask, dim=-1).unsqueeze(-1)
+            elif self.is_correction_level == "geo":
+                gating_stat = torch.exp(masked_mean(is_log_ratio, action_mask, dim=-1).unsqueeze(-1))
+            elif self.is_correction_level != "token":
+                raise ValueError(f"unknown is_correction_level {self.is_correction_level}")
+
+            # (2) gate the per-unit statistic (is_correction_mode) -> per-token coefficient
+            # + per-unit filtered flag. Survivors always carry their per-token IS ratio.
+            if self.is_correction_mode == "mask":
+                keep = (gating_stat >= low) & (gating_stat <= high)
+                coef = torch.where(keep.expand_as(token_ratio), token_ratio, torch.zeros_like(token_ratio))
+                unit_filtered = ~keep
+            elif self.is_correction_mode == "clip":
+                # Keep every unit, clamp its weight into [low, high] (applied per-token).
+                coef = gating_stat.clamp(min=low, max=high).expand_as(token_ratio)
+                unit_filtered = (gating_stat < low) | (gating_stat > high)
+            elif self.is_correction_mode == "trunc":  # cap only the upper tail; small weights unchanged.
+                coef = gating_stat.clamp(max=high).expand_as(token_ratio)
+                unit_filtered = gating_stat > high
+            else:
+                raise ValueError(f"unknown is_correction_mode {self.is_correction_mode}")
+
+            loss = coef * loss
+            # Filter fraction at the unit's own granularity: a masked-token mean for token-level,
+            # one flag PER SEQUENCE for seq/geo. The flags stay 1-D because the actor weights a 1-D
+            # metric by samples and a scalar by action tokens, which would skew a sequence fraction.
+            if self.is_correction_level == "token":
+                is_filter_ratio = masked_mean(unit_filtered.float(), action_mask, dim=None)
+            else:
+                is_filter_ratio = unit_filtered.float().flatten()
+
+            vllm_logprob_diff = torch.nan_to_num(
+                rollout_log_probs.float() - old_log_probs.float(),
+                nan=0.0,
+                posinf=log_ratio_limit,
+                neginf=-log_ratio_limit,
+            )
+            vllm_kl = masked_mean(vllm_logprob_diff, action_mask, dim=None)
+
+        if self.score_centering:
+            if top_log_probs is None or rollout_top_log_probs is None:
+                raise ValueError(
+                    "score_centering needs the sampler's top-k log-probs (--algo.advantage.score_centering_top_k)"
+                )
+            # The head carries the same per-token weight f as the sampled token above (1 when the IS
+            # correction is off); that is what keeps E_q[grad] = 0 (paper Eq. 14).
+            mode, (low, high) = "none", (None, None)
+            if self.is_correction_level != "off":
+                mode, (low, high) = self.is_correction_mode, self.is_correction_threshold
+            correction = score_centering_correction(
+                top_log_probs, rollout_top_log_probs, mode=mode, low=low, high=high
+            )
+            loss = loss + advantages * correction
+
+        # Reported loss is a plain per-token mean, decoupled from the gradient
+        # normalization below. With the slime "global token-mean" denominator
+        # (batch_num_tokens = whole optimizer-step batch), the aggregated loss is
+        # a fraction-of-window, not a per-token mean — so we report this instead
+        # to keep logged values interpretable and comparable across configs.
+        reported_loss = masked_mean(loss.detach(), action_mask, dim=None)
+
+        if self.token_level_loss:
+            loss = agg_loss(
+                loss,
+                action_mask,
+                self.loss_agg_mode,
+                dp_size=dp_size,
+                batch_num_tokens=batch_num_tokens,
+                global_batch_size=global_batch_size,
+                prompt_token_counts=prompt_token_counts,
+            )
+        else:
+            loss = agg_loss(
+                loss,
+                action_mask,
+                "seq-mean-token-mean",
+                dp_size=dp_size,
+                global_batch_size=global_batch_size,
+            )
+        policy_kl = masked_mean(-policy_log_ratio.detach(), action_mask, dim=None)
+        return loss, reported_loss, clip_ratio, policy_kl, vllm_kl, is_filter_ratio

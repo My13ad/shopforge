@@ -1,0 +1,53 @@
+{
+  "model": "/root/autodl-tmp/shop/model",
+  "adapter": "/root/autodl-tmp/shop/sft-workspace/outputs/sft-improvement/round1-20261012-112111/E1-training/adapter",
+  "validation_sha256": "9525cc2fb04a1d8d38ae2db959397da908dde3fea766f580fdcf77d1239533cc",
+  "train_sha256": "8c3a6ff0033f6ea672af609891e747d60652ddc17e8d3c8eacb19e9d96dd9477",
+  "benchmark_sha256": "624b6ee0513cfeb0e2e7efe2a21db7658d020419ceb7a6946937403e0cac5046",
+  "adapter_sha256": "f191ccd7ad9270e2b9aa8ddc12e4ff8a0bd542ee22e9a008774542b25367f1c6",
+  "chat_template_sha256": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80",
+  "driver_sha256": "174fa1d2045ec982b3a8dfae5821ee32cd8e65ca959e18f44642ef7a88810dcd",
+  "packages": {
+    "torch": "2.8.0+cu128",
+    "triton": "3.4.0",
+    "transformers": "5.15.0.dev0",
+    "peft": "0.21.2",
+    "flash-linear-attention": "0.5.2",
+    "fla-core": "0.5.2",
+    "einops": "0.8.2"
+  },
+  "linear_attention_kernels": {
+    "causal_conv1d_fn": null,
+    "causal_conv1d_update": "transformers.models.qwen3_5.modeling_qwen3_5.torch_causal_conv1d_update",
+    "chunk_gated_delta_rule": "fla.ops.gated_delta_rule.chunk.chunk_gated_delta_rule",
+    "recurrent_gated_delta_rule": "fla.ops.gated_delta_rule.fused_recurrent.fused_recurrent_gated_delta_rule"
+  },
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "protocol": {
+    "split": "SFT validation development set; not the frozen final test",
+    "backend": "Transformers + PEFT, candidate with saved uniform-SFT reference",
+    "max_steps": 35,
+    "max_tokens": 512,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "context_window": 24576,
+    "context_safety_margin": 512,
+    "context_compaction": false,
+    "observation_token_budget": 1536,
+    "observation_detail_token_budget": 4096,
+    "observation_generic_token_budget": 768,
+    "observation_search_top_k": 20,
+    "environment": "shopsimulator-environment-v2.1",
+    "reward": "shopsimulator-reward-v3",
+    "rollouts_per_task_per_actor": 1,
+    "seed": 42,
+    "tool_parser": "Qwen XML completed-function parser; truncated functions not repaired",
+    "stop_token_ids": [
+      248044,
+      248046
+    ],
+    "stop_policy": "Document EOS and Qwen <|im_end|> assistant boundary"
+  },
+  "reference_evaluation": "/root/autodl-tmp/shop/sft-workspace/outputs/sft-improvement/round1-20261012-112111/reference",
+  "reference_adapter_sha256": "0d7242f441493a01c8d78aaa00712d067c9f2d183732701eab16f47b98ea334d"
+}

@@ -1,0 +1,188 @@
+--- verified-opd32/common.py
++++ opd/runtime/common.py
+@@ -36,6 +36,35 @@
+         for block in iter(lambda: stream.read(1024**2), b""):
+             digest.update(block)
+     return digest.hexdigest()
++
++
++def runtime_paths(args):
++    """Resolve explicitly supplied runtimes while retaining the historical layout."""
++    root = args.shop_root.resolve()
++    return {name: Path(value or root / fallback).expanduser().resolve() for name, value, fallback in [
++        ('python', args.student_python, 'sft-venv/bin/python'),
++        ('teacher_python', args.teacher_python, 'teacher-vllm-venv/bin/python'),
++        ('model', args.student_model, 'model'),
++        ('teacher', args.teacher_model, 'teacher-qwen38-fp8')]}
++
++
++def verify_initial_adapter(adapter, reference_config, expected_sha256):
++    """A fresh SFT run must match an explicitly pinned reference and actual file."""
++    import re
++    if not isinstance(expected_sha256, str) or not re.fullmatch(r'[0-9a-f]{64}', expected_sha256):
++        raise ValueError('expected parent SHA-256 must be an explicit lowercase64 digest')
++    actual = sha(Path(adapter) / 'adapter_model.safetensors')
++    if actual != expected_sha256 or actual != reference_config['adapter_sha256']:
++        raise ValueError('SFT parent, reference evaluation and expected digest differ')
++    return actual
++
++
++def manifest_training_ids(path, train_ids, development_ids, final_ids, excluded_ids, seed, count):
++    selected = [row['task_id'] for row in rows(path)]
++    if len(selected) != count or any(type(t) is not int for t in selected):
++        raise ValueError('frozen OPD task manifest has an unexpected size or ID type')
++    return choose_training_ids(train_ids, development_ids, final_ids, excluded_ids,
++                               seed, count, prefix_ids=selected)
+ 
+ 
+ def importance_loss(current_logp, old_logp, teacher_logp):
+--- verified-opd32/phases.py
++++ opd/runtime/phases.py
+@@ -14,7 +14,7 @@
+ import time
+ 
+ from common import (append, checkpoint_audit, choose_training_ids, extract_teacher_scores,
+-                    importance_loss, now, read, rows, sha, write)
++                    importance_loss, now, read, rows, sha, write, verify_initial_adapter, manifest_training_ids)
+ 
+ 
+ E1_SHA = "f191ccd7ad9270e2b9aa8ddc12e4ff8a0bd542ee22e9a008774542b25367f1c6"
+@@ -33,7 +33,7 @@
+     cal_result = cal / "run-20261013-1/result"
+     cal_config = read(cal_result / "run_config.json")
+     ref_config = read(reference / "run_config.json")
+-    assert sha(args.adapter / "adapter_model.safetensors") == ref_config["adapter_sha256"] == E1_SHA
++    initial_sha = verify_initial_adapter(args.adapter, ref_config, args.expected_parent_sha256 or E1_SHA)
+     for key, file in [("train", "train.jsonl"), ("development", "validation.jsonl")]:
+         assert sha(workspace / "data/sft" / file) == DATA_SHA[key]
+     source = run / "source"
+@@ -63,7 +63,7 @@
+     prefix_config = None
+     if args.task_prefix_run:
+         prefix_config = read(args.task_prefix_run / "run_config.json")
+-        assert prefix_config["initial_adapter_sha256"] == E1_SHA
++        assert prefix_config["initial_adapter_sha256"] == initial_sha
+         assert prefix_config["dataset_sha256"] == DATA_SHA
+         assert prefix_config["sampling_seed"] == args.sampling_seed
+         assert prefix_config["selection_seed"] == args.selection_seed
+@@ -75,6 +75,12 @@
+                                   [r["task_id"] for r in development], final_ids,
+                                   cal_config["task_manifest"]["task_ids"], args.selection_seed,
+                                   args.training_tasks, prefix_ids=task_prefix)
++    if args.training_task_manifest:
++        if args.task_prefix_run:
++            raise ValueError('choose a frozen task manifest or a prefix run, not both')
++        selected = manifest_training_ids(args.training_task_manifest, [r['task_id'] for r in training],
++            [r['task_id'] for r in development], final_ids, cal_config['task_manifest']['task_ids'],
++            args.selection_seed, args.training_tasks)
+     assert len(training) == 800 and len(development) == 200
+     by_id = {r["task_id"]: r for r in training}
+     (run / "input").mkdir()
+@@ -134,7 +140,7 @@
+                 "observation_detail_token_budget", "observation_generic_token_budget", "observation_search_top_k"]}
+     config = {"schema": "shop-opd-pilot-v1", "created_at": now(), "workspace": str(workspace),
+               "model": str(args.model.resolve()), "teacher": str(args.teacher.resolve()),
+-              "initial_adapter": str(args.adapter.resolve()), "initial_adapter_sha256": E1_SHA,
++              "initial_adapter": str(args.adapter.resolve()), "initial_adapter_sha256": initial_sha,
+               "reference": str(reference), "calibration": str(cal), "training_task_ids": selected,
+               "sampling_seed": args.sampling_seed, "selection_seed": args.selection_seed,
+               "optimizer_steps": args.training_tasks // args.tasks_per_update,
+@@ -156,6 +162,7 @@
+               "training_tasks_sha256": sha(selected_file), "anchors_sha256": sha(run / "input/anchors.json"),
+               "source_sha256": {str(p.relative_to(source)): sha(p) for p in source.rglob("*.py")},
+               "source_reference_checks_passed": True, "student_teacher_token_id_mapping_identical": True,
++              "training_task_manifest_sha256": sha(args.training_task_manifest) if args.training_task_manifest else None,
+               "opd_method_source": "https://thinkingmachines.ai/blog/on-policy-distillation/",
+               "final_evaluation_started": False}
+     write(run / "run_config.json", config)
+@@ -508,6 +515,8 @@
+     parser.add_argument("--adapter", type=Path)
+     parser.add_argument("--reference", type=Path)
+     parser.add_argument("--calibration", type=Path)
++    parser.add_argument("--expected-parent-sha256", help="Explicit digest for a newly trained and evaluated SFT parent")
++    parser.add_argument('--training-task-manifest', type=Path, help='Use these exact eligible IDs in the saved order')
+     parser.add_argument("--training-tasks", type=int, default=64)
+     parser.add_argument("--tasks-per-update", type=int, default=8)
+     parser.add_argument("--sampling-seed", type=int, default=42)
+--- verified-opd32/worker.py
++++ opd/runtime/worker.py
+@@ -9,13 +9,18 @@
+ import time
+ from urllib.request import urlopen
+ 
+-from common import now, read, sha, write
++from common import now, read, sha, write, runtime_paths
+ 
+ 
+ def main():
+     parser = argparse.ArgumentParser()
+     for name in ["workspace", "shop-root", "adapter", "reference", "calibration", "run"]:
+         parser.add_argument("--" + name, type=Path, required=True)
++    for name in ('student-model', 'teacher-model', 'student-python', 'teacher-python'):
++        parser.add_argument('--' + name, type=Path)
++    parser.add_argument('--expected-parent-sha256', help='Explicit digest when using a new SFT reference')
++    parser.add_argument('--training-task-manifest', type=Path)
++    parser.add_argument('--shop-url', default='http://127.0.0.1:5700')
+     parser.add_argument("--preparation-only", action="store_true")
+     parser.add_argument("--training-tasks", type=int, default=64)
+     parser.add_argument("--tasks-per-update", type=int, default=8)
+@@ -33,7 +38,8 @@
+         parser.error("Timeout, retention interval and disk reserve are invalid")
+     root, run = args.shop_root.resolve(), args.run.resolve()
+     run.mkdir(parents=True, exist_ok=False)
+-    python = root / "sft-venv/bin/python"
++    paths = runtime_paths(args)
++    python = paths['python']
+     started = time.monotonic()
+     child, server, server_log = None, None, None
+     progress_file = None
+@@ -125,8 +131,8 @@
+             raise
+         except Exception:
+             pass
+-        argv = [str(root / "teacher-vllm-venv/bin/python"), "-m", "vllm.entrypoints.openai.api_server",
+-            "--model", str(root / "teacher-qwen38-fp8"), "--served-model-name", "qwen38-teacher",
++        argv = [str(paths['teacher_python']), "-m", "vllm.entrypoints.openai.api_server",
++            "--model", str(paths['teacher']), "--served-model-name", "qwen38-teacher",
+             "--host", "127.0.0.1", "--port", "5800", "--dtype", "bfloat16", "--max-model-len", "24576",
+             "--gpu-memory-utilization", "0.85", "--max-num-seqs", "1", "--max-num-batched-tokens", "1024",
+             "--enforce-eager", "--no-enable-prefix-caching", "--limit-mm-per-prompt", '{"image":0,"video":0}',
+@@ -170,12 +176,14 @@
+             raise RuntimeError("Insufficient free disk for the requested initial reserve")
+         execute("objective_tests", [str(python), str(Path(__file__).with_name("test_objectives.py"))])
+         execute("preparation", [str(python), str(Path(__file__).with_name("phases.py")), "prepare",
+-            "--run", str(run), "--workspace", str(args.workspace), "--model", str(root / "model"),
+-            "--teacher", str(root / "teacher-qwen38-fp8"), "--adapter", str(args.adapter),
++            "--run", str(run), "--workspace", str(args.workspace), "--model", str(paths['model']),
++            "--teacher", str(paths['teacher']), "--adapter", str(args.adapter),
+             "--reference", str(args.reference), "--calibration", str(args.calibration),
+             "--training-tasks", str(args.training_tasks), "--tasks-per-update", str(args.tasks_per_update),
+             "--sampling-seed", str(args.sampling_seed), "--selection-seed", str(args.selection_seed)]
+-            + (["--task-prefix-run", str(args.task_prefix_run)] if args.task_prefix_run else []),
++            + (["--task-prefix-run", str(args.task_prefix_run)] if args.task_prefix_run else [])
++            + (["--expected-parent-sha256", args.expected_parent_sha256] if args.expected_parent_sha256 else [])
++            + (["--training-task-manifest", str(args.training_task_manifest)] if args.training_task_manifest else []),
+             run / "preparation-status.json")
+         if args.preparation_only:
+             state.update(phase="preparation_completed", finished_at=now())
+@@ -195,7 +203,7 @@
+             wait_gpu_release()
+             execute(label + "_rollout", prefix + ["rollout", "--run", str(run), "--adapter", str(adapter),
+                 "--policy-sha", sha(adapter / "adapter_model.safetensors"), "--update", str(number),
+-                "--output", str(current / "rollout")] + (["--smoke"] if smoke else []), current / "rollout/status.json")
++                "--output", str(current / "rollout"), "--shop-url", args.shop_url] + (["--smoke"] if smoke else []), current / "rollout/status.json")
+             start_teacher(label)
+             execute(label + "_scoring", prefix + ["score", "--run", str(run), "--input", str(current / "rollout"),
+                 "--output", str(current / "scoring"), "--update", str(number)], current / "scoring/status.json", needs_teacher=True)
+@@ -232,9 +240,9 @@
+         for name, candidate in [("control", run / "control-training/adapter"), ("opd", adapter)]:
+             wait_gpu_release()
+             execute(name + "_development_evaluation", [str(python), "-u", str(run / "source/evaluate_candidate.py"),
+-                "--workspace", str(args.workspace), "--model", str(root / "model"), "--adapter", str(candidate),
++                "--workspace", str(args.workspace), "--model", str(paths['model']), "--adapter", str(candidate),
+                 "--reference-evaluation", str(args.reference), "--output", str(run / "evaluation" / name),
+-                "--count", "200"], run / "evaluation" / name / "status.json")
++                "--count", "200", "--base-url", args.shop_url], run / "evaluation" / name / "status.json")
+         execute("result_comparison", prefix + ["analyse", "--run", str(run)])
+         state.update(phase="completed", finished_at=now(), comparison_file=str(run / "comparison.json"))
+         state.update(active_pid=None, active_command=None)
